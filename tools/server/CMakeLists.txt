@@ -38,6 +38,10 @@ set(TARGET_SRCS
     server-http.h
     server-models.cpp
     server-models.h
+    # SOPA extensions — isolated in sopa/ to minimise upstream merge conflicts
+    sopa/sopa-manager.cpp
+    sopa/sopa-endpoints.cpp
+    sopa/sopa-generate.cpp
 )
 
 option(LLAMA_BUILD_WEBUI "Build the embedded Web UI" ON)

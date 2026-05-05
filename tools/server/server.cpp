@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "sopa/sopa.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -13,6 +14,8 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -23,6 +26,28 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+static bool sopa_env_bool(const char * name, bool fallback) {
+    const char * value = std::getenv(name);
+    if (!value) {
+        return fallback;
+    }
+    if (std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "TRUE") == 0 ||
+        std::strcmp(value, "yes") == 0 ||
+        std::strcmp(value, "on") == 0) {
+        return true;
+    }
+    if (std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "FALSE") == 0 ||
+        std::strcmp(value, "no") == 0 ||
+        std::strcmp(value, "off") == 0) {
+        return false;
+    }
+    return fallback;
+}
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -110,6 +135,26 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // Initialize SOPA model manager — configure via SOPA_SMALL_MODEL / SOPA_LARGE_MODEL env vars.
+    // server_owns_model=true when --model was supplied: SopaManager rejects /sopa/load to
+    // prevent a duplicate VRAM allocation alongside the server's own model instance.
+    // Phase 2: launch without --model so server_owns_model=false and SopaManager drives
+    // all inference via /sopa/load + the custom generation pipeline.
+    {
+        SopaConfig sopa_cfg;
+        if (const char * p = std::getenv("SOPA_SMALL_MODEL")) { sopa_cfg.small_model_path = p; }
+        if (const char * p = std::getenv("SOPA_LARGE_MODEL")) { sopa_cfg.large_model_path = p; }
+        sopa_cfg.server_owns_model = !params.model.path.empty();
+        sopa_cfg.use_mmap          = sopa_env_bool("SOPA_USE_MMAP", true) &&
+                                     !sopa_env_bool("SOPA_NO_MMAP", false);
+        sopa_cfg.swa_full          = sopa_env_bool("SOPA_SWA_FULL", false);
+        sopa_cfg.small_enable_thinking = sopa_env_bool("SOPA_SMALL_ENABLE_THINKING",
+                                                       sopa_cfg.small_enable_thinking);
+        sopa_cfg.large_enable_thinking = sopa_env_bool("SOPA_LARGE_ENABLE_THINKING",
+                                                       sopa_cfg.large_enable_thinking);
+        g_sopa.init(sopa_cfg);
+    }
+
     LOG_INF("build_info: %s\n", llama_build_info());
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
 
@@ -179,8 +224,12 @@ int main(int argc, char ** argv) {
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+    // Phase 2: when SopaManager drives inference (no --model flag) the sopa generation
+    // handler is registered instead of the standard one — registered below with sopa routes.
+    if (g_sopa.server_owns_model()) {
+        ctx_http.post("/chat/completions",     ex_wrapper(routes.post_chat_completions));
+        ctx_http.post("/v1/chat/completions",  ex_wrapper(routes.post_chat_completions));
+    }
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
@@ -204,6 +253,19 @@ int main(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // SOPA model management
+    SopaRoutes sopa_routes = make_sopa_routes();
+    ctx_http.get ("/sopa/status",              ex_wrapper(sopa_routes.get_status));
+    ctx_http.post("/sopa/load",                ex_wrapper(sopa_routes.post_load));
+    ctx_http.post("/sopa/unload",              ex_wrapper(sopa_routes.post_unload));
+    ctx_http.post("/sopa/interrupt",           ex_wrapper(sopa_routes.post_interrupt));
+    // Phase 2: override /v1/chat/completions with SopaManager-owned generation when
+    // server_owns_model=false (no --model flag). Registered after the standard handler
+    // so httplib's last-wins semantics route all chat completions through sopa-generate.
+    if (!g_sopa.server_owns_model()) {
+        ctx_http.post("/v1/chat/completions",  ex_wrapper(sopa_routes.post_completions));
+        ctx_http.post("/chat/completions",     ex_wrapper(sopa_routes.post_completions));
+    }
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
     if (params.webui_mcp_proxy) {
         SRV_WRN("%s", "-----------------\n");
