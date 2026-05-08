@@ -152,6 +152,7 @@ int main(int argc, char ** argv) {
                                                        sopa_cfg.small_enable_thinking);
         sopa_cfg.large_enable_thinking = sopa_env_bool("SOPA_LARGE_ENABLE_THINKING",
                                                        sopa_cfg.large_enable_thinking);
+
         g_sopa.init(sopa_cfg);
     }
 

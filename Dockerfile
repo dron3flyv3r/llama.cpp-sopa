@@ -25,6 +25,7 @@ RUN cp /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/lib/libcuda.so.1 \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES=89 \
         -DLLAMA_BUILD_WEBUI=OFF \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
     && cmake --build build --target llama-server -j"$(nproc)"
 
 # ─── Runtime stage ───────────────────────────────────────────────────────────

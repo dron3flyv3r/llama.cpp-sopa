@@ -184,6 +184,24 @@ static bool flush_pending_or_stop(SopaGenCtx & gen, std::string & output, const 
     return true;
 }
 
+static bool decode_prompt_in_batches(SopaGenCtx & gen) {
+    const int32_t n_batch = std::max<int32_t>(1, (int32_t) llama_n_batch(gen.ctx));
+    int32_t pos = 0;
+
+    while (pos < (int32_t) gen.prompt_tokens.size()) {
+        const int32_t n_tokens = std::min<int32_t>(n_batch, (int32_t) gen.prompt_tokens.size() - pos);
+        llama_batch batch = llama_batch_get_one(gen.prompt_tokens.data() + pos, n_tokens);
+        if (llama_decode(gen.ctx, batch) != 0) {
+            LOG_ERR("sopa-generate: prefill decode failed at token %d/%zu (chunk=%d, n_batch=%d)\n",
+                    pos, gen.prompt_tokens.size(), n_tokens, n_batch);
+            return false;
+        }
+        pos += n_tokens;
+    }
+
+    return true;
+}
+
 static void append_parsed_chat_deltas(SopaGenCtx & gen, const std::string & text, bool is_partial, std::string & output) {
     if (text.empty()) {
         return;
@@ -362,11 +380,9 @@ server_http_res_ptr handle_sopa_completions(const server_http_req & req) {
         llama_batch batch;
 
         if (!gen->prefill_done) {
-            // First call: decode the full prompt.
-            batch = llama_batch_get_one(gen->prompt_tokens.data(),
-                                        (int32_t)gen->prompt_tokens.size());
-            if (llama_decode(gen->ctx, batch) != 0) {
-                LOG_ERR("sopa-generate: prefill decode failed\n");
+            // First call: decode the prompt in logical-batch chunks. A prompt can
+            // fit in n_ctx while still being larger than llama_n_batch(ctx).
+            if (!decode_prompt_in_batches(*gen)) {
                 output = sse_done();
                 finish_inference(*gen);
                 return false;

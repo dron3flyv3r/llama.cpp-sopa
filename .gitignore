@@ -147,3 +147,4 @@ poetry.toml
 a.out.*
 
 AGENTS.local.md
+.sopa-deploy.json
