@@ -2,8 +2,6 @@
 #include "log.h"
 #include "server-common.h"
 
-#include "ggml.h"
-#include "src/llama-model.h"
 #include "mtmd-helper.h"
 
 #include <chrono>
@@ -13,128 +11,6 @@
 #include <thread>
 
 using namespace std::chrono_literals;
-
-// CPU-side EAGLE backbone injection helper.
-// Computes: pre_proj(h_t || emb_t) + tok_embd_draft[id_last]
-//   h_t:   target hidden state        — backbone_h elements, f32
-//   emb_t: target tok_embd[id_last]   — backbone_h elements, from target model
-//
-// pre_proj weight: {2*backbone_h, n_embd_draft}, q8_0 (from draft model)
-// tok_embd_draft:  {n_embd_draft, n_vocab},      q8_0 (from draft model)
-// tok_embd_tgt:    {backbone_h,   n_vocab},       any  (from target model; f32/f16/q8_0)
-struct SopaBackboneInjector {
-    const ggml_tensor * pre_proj      = nullptr;
-    const ggml_tensor * tok_embd_dft  = nullptr;
-    const ggml_tensor * tok_embd_tgt  = nullptr;
-    int64_t backbone_h    = 0;
-    int64_t n_embd_draft  = 0;
-
-    SopaBackboneInjector(llama_model * draft_model, llama_model * tgt_model) {
-        pre_proj     = draft_model->get_tensor("mtp.pre_projection.weight");
-        tok_embd_dft = draft_model->get_tensor("token_embd.weight");
-        tok_embd_tgt = tgt_model->get_tensor("token_embd.weight");
-        if (pre_proj) {
-            backbone_h   = pre_proj->ne[0] / 2;
-            n_embd_draft = pre_proj->ne[1];
-        }
-    }
-
-    bool valid() const {
-        return pre_proj && tok_embd_dft && tok_embd_tgt &&
-               backbone_h > 0 && n_embd_draft > 0 &&
-               pre_proj->type     == GGML_TYPE_Q8_0 &&
-               tok_embd_dft->type == GGML_TYPE_Q8_0 &&
-               // target tok_embd must be f32, f16, or q8_0
-               (tok_embd_tgt->type == GGML_TYPE_F32  ||
-                tok_embd_tgt->type == GGML_TYPE_F16  ||
-                tok_embd_tgt->type == GGML_TYPE_Q8_0) &&
-               // sizes must be consistent
-               tok_embd_tgt->ne[0] == backbone_h;
-    }
-
-    // Dequantize one q8_0 row (row_idx) of tensor t into out (resized to ne[0] elements).
-    static void dequant_q8_0_row(const ggml_tensor * t, int64_t row_idx, std::vector<float> & out) {
-        const int64_t n_cols   = t->ne[0];
-        const int64_t n_blocks = n_cols / 32;
-        out.resize(n_cols);
-
-        struct Block { uint16_t d; int8_t qs[32]; };
-        const auto * blocks = reinterpret_cast<const Block *>(
-            static_cast<const uint8_t *>(t->data) + row_idx * (size_t)n_blocks * sizeof(Block));
-
-        for (int64_t b = 0; b < n_blocks; ++b) {
-            const float scale = ggml_fp16_to_fp32(blocks[b].d);
-            for (int j = 0; j < 32; ++j) {
-                out[b * 32 + j] = blocks[b].qs[j] * scale;
-            }
-        }
-    }
-
-    // Dequantize one row of tok_embd_tgt into out — handles f32/f16/q8_0.
-    void dequant_tgt_row(int64_t row_idx, std::vector<float> & out) const {
-        const int64_t n_cols = tok_embd_tgt->ne[0];
-        out.resize(n_cols);
-        if (tok_embd_tgt->type == GGML_TYPE_F32) {
-            const float * src = static_cast<const float *>(tok_embd_tgt->data) + row_idx * n_cols;
-            std::copy(src, src + n_cols, out.data());
-        } else if (tok_embd_tgt->type == GGML_TYPE_F16) {
-            const uint16_t * src = static_cast<const uint16_t *>(tok_embd_tgt->data) + row_idx * n_cols;
-            for (int64_t i = 0; i < n_cols; ++i) {
-                out[i] = ggml_fp16_to_fp32(src[i]);
-            }
-        } else {
-            dequant_q8_0_row(tok_embd_tgt, row_idx, out);
-        }
-    }
-
-    // Compute pre_proj(h_t || emb_t) + tok_embd_draft[id_last]
-    // h_t must have backbone_h f32 elements (from llama_get_embeddings_ith on target).
-    std::vector<float> compute(const float * h_t, llama_token id_last) const {
-        std::vector<float> result(n_embd_draft, 0.0f);
-
-        // emb_t: target model embedding for id_last, shape {backbone_h}.
-        std::vector<float> emb_t;
-        dequant_tgt_row(id_last, emb_t);
-
-        // pre_proj({h_t, emb_t}): both halves are backbone_h elements.
-        const int64_t n_blocks_per_row = (2 * backbone_h) / 32;
-        const int64_t n_blocks_h       = backbone_h / 32;
-        struct Block { uint16_t d; int8_t qs[32]; };
-        const auto * row_base = static_cast<const uint8_t *>(pre_proj->data);
-
-        for (int64_t row = 0; row < n_embd_draft; ++row) {
-            const auto * blocks = reinterpret_cast<const Block *>(
-                row_base + row * (size_t)n_blocks_per_row * sizeof(Block));
-            float dot = 0.0f;
-            // First half: h_t
-            for (int64_t b = 0; b < n_blocks_h; ++b) {
-                const float scale = ggml_fp16_to_fp32(blocks[b].d);
-                const float * h   = h_t + b * 32;
-                for (int j = 0; j < 32; ++j) {
-                    dot += blocks[b].qs[j] * scale * h[j];
-                }
-            }
-            // Second half: emb_t (target token embedding, same backbone_h dims)
-            for (int64_t b = n_blocks_h; b < n_blocks_per_row; ++b) {
-                const float scale    = ggml_fp16_to_fp32(blocks[b].d);
-                const float * e      = emb_t.data() + (b - n_blocks_h) * 32;
-                for (int j = 0; j < 32; ++j) {
-                    dot += blocks[b].qs[j] * scale * e[j];
-                }
-            }
-            result[row] = dot;
-        }
-
-        // Add draft tok_embd[id_last] as residual.
-        std::vector<float> emb_dft;
-        dequant_q8_0_row(tok_embd_dft, id_last, emb_dft);
-        for (int64_t i = 0; i < n_embd_draft; ++i) {
-            result[i] += emb_dft[i];
-        }
-
-        return result;
-    }
-};
 
 SopaManager g_sopa;
 
@@ -258,6 +134,9 @@ bool SopaManager::load(SopaModelType type, std::optional<bool> enable_thinking_o
     cparams.offload_kqv      = cfg_.offload_kqv;
     cparams.op_offload       = cfg_.op_offload;
     cparams.swa_full         = cfg_.swa_full;
+    if (mtp_tokens_for_type(cfg_, type) > 0 && !draft_path_for_type(cfg_, type).empty()) {
+        cparams.n_rs_seq = mtp_tokens_for_type(cfg_, type);
+    }
 
     llama_context * c = llama_init_from_model(m, cparams);
     if (!c) {
@@ -304,9 +183,6 @@ bool SopaManager::load(SopaModelType type, std::optional<bool> enable_thinking_o
         active_type_ = type;
         active_enable_thinking_ = enable_thinking;
         load_draft_locked(type);
-        if (backbone_injector_) {
-            llama_set_embeddings(ctx_, true);
-        }
         state_       = SopaState::READY;
         last_active_ = std::chrono::steady_clock::now();
     }
@@ -370,9 +246,10 @@ void SopaManager::kv_clear() {
 }
 
 void SopaManager::unload_draft_locked() {
-    delete backbone_injector_;
-    backbone_injector_ = nullptr;
-
+    if (draft_ctx_) {
+        llama_free(draft_ctx_);
+        draft_ctx_ = nullptr;
+    }
     if (draft_model_) {
         llama_model_free(draft_model_);
         draft_model_ = nullptr;
@@ -437,20 +314,35 @@ void SopaManager::load_draft_locked(SopaModelType type) {
         return;
     }
 
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx            = llama_n_ctx(ctx_);
+    cparams.n_batch          = llama_n_batch(ctx_);
+    cparams.n_ubatch         = cfg_.n_ubatch;
+    cparams.n_threads        = cfg_.n_threads;
+    cparams.n_threads_batch  = cfg_.n_threads_batch;
+    cparams.flash_attn_type  = cfg_.flash_attn_type;
+    cparams.type_k           = cfg_.cache_type_k;
+    cparams.type_v           = cfg_.cache_type_v;
+    cparams.offload_kqv      = cfg_.offload_kqv;
+    cparams.op_offload       = cfg_.op_offload;
+    cparams.swa_full         = cfg_.swa_full;
+    cparams.ctx_type         = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.ctx_other        = ctx_;
+    cparams.n_rs_seq         = 0;
+
+    draft_ctx_ = llama_init_from_model(draft_model_, cparams);
+    if (!draft_ctx_) {
+        draft_load_error_ = "failed to create MTP draft context";
+        LOG_WRN("sopa-manager: MTP disabled — %s\n", draft_load_error_.c_str());
+        llama_model_free(draft_model_);
+        draft_model_ = nullptr;
+        draft_placement_ = "failed";
+        return;
+    }
+
     draft_loaded_ = true;
     mtp_enabled_  = true;
-
-    // Try to build backbone injector for EAGLE-style Phase 2 drafting.
-    auto * inj = new SopaBackboneInjector(draft_model_, model_);
-    if (inj->valid()) {
-        backbone_injector_ = inj;
-        LOG_INF("sopa-manager: backbone injector ready "
-                "(backbone_h=%lld, n_embd_draft=%lld)\n",
-                (long long) inj->backbone_h, (long long) inj->n_embd_draft);
-    } else {
-        delete inj;
-        LOG_INF("sopa-manager: no backbone injector (Phase 1 mode)\n");
-    }
+    LOG_INF("sopa-manager: upstream MTP draft context ready (tokens=%d)\n", mtp_tokens);
 }
 
 void SopaManager::interrupt() {
@@ -546,19 +438,6 @@ std::string SopaManager::get_draft_model_path() const {
 int SopaManager::mtp_tokens() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return mtp_enabled_ ? active_mtp_tokens_ : 0;
-}
-
-bool SopaManager::has_backbone_injector() const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return backbone_injector_ != nullptr;
-}
-
-std::vector<float> SopaManager::compute_backbone_injection(const float * h_t, llama_token id_last) const {
-    // Called during INFERRING state — backbone_injector_ is stable (unload blocked).
-    if (!backbone_injector_) {
-        return {};
-    }
-    return backbone_injector_->compute(h_t, id_last);
 }
 
 void SopaManager::idle_loop() {

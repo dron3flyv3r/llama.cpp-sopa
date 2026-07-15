@@ -3,8 +3,6 @@
 #include "llama.h"
 #include "mtmd.h"
 
-struct SopaBackboneInjector;  // defined in sopa-manager.cpp
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -111,16 +109,12 @@ class SopaManager {
     llama_context * get_context() const { return ctx_; }
 
     llama_model * get_draft_model() const { return draft_model_; }
+    llama_context * get_draft_context() const { return draft_ctx_; }
     mtmd_context * get_mtmd_context() const { return mtmd_ctx_; }
 
     std::string get_draft_model_path() const;
 
     int mtp_tokens() const;
-
-    bool has_backbone_injector() const;
-
-    // compute pre_proj(h_t || 0) + tok_embd_draft[id_last]; returns {} if no injector
-    std::vector<float> compute_backbone_injection(const float * h_t, llama_token id_last) const;
 
     bool interrupted() const { return interrupt_.load(); }
 
@@ -151,13 +145,13 @@ class SopaManager {
     llama_context *                       ctx_         = nullptr;
     mtmd_context *                        mtmd_ctx_    = nullptr;
     llama_model *                         draft_model_ = nullptr;
+    llama_context *                       draft_ctx_   = nullptr;
     bool                                  draft_loaded_ = false;
     bool                                  mtp_enabled_ = false;
     int                                   active_mtp_tokens_ = 0;
     std::string                           draft_model_path_;
     std::string                           draft_placement_ = "none";
     std::string                           draft_load_error_;
-    SopaBackboneInjector *                backbone_injector_ = nullptr;
     std::atomic<bool>                     interrupt_{ false };
     std::atomic<bool>                     running_{ false };
     std::thread                           idle_thread_;

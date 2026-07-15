@@ -7,6 +7,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "speculative.h"
+#include "mtmd-helper.h"
 
 #include "llama.h"
 
@@ -44,6 +45,7 @@ struct SopaGenCtx {
 
     std::vector<llama_token> prompt_tokens;
     server_tokens       media_tokens;
+    mtmd::batch_ptr     media_batch;
     bool                has_media = false;
     std::vector<llama_token> prompt_tgt;
     std::vector<llama_token> gen_token_ids;  // generated token IDs, for KV reuse
@@ -55,7 +57,6 @@ struct SopaGenCtx {
     int32_t     max_tokens  = 512;
     bool        prefill_done = false;
     bool        use_mtp = false;
-    bool        has_injection = false;
     std::string pending;  // text withheld until it is known not to be a stop marker
     std::vector<std::string> stop_strings;
     std::string generated_text;
@@ -114,11 +115,18 @@ static std::string sse_delta(const json & delta) {
 }
 
 static json sopa_context_json(const SopaGenCtx & gen) {
+    const double acceptance = gen.n_drafted > 0
+        ? (double) gen.n_accepted / (double) gen.n_drafted
+        : 0.0;
     return json{
         {"n_ctx",            llama_n_ctx(gen.ctx)},
         {"n_prompt_tokens",  (int32_t) gen.prompt_tokens.size()},
         {"n_prefix_tokens",  gen.n_prefix},
         {"n_generated",      gen.n_generated},
+        {"mtp_enabled",      gen.use_mtp},
+        {"mtp_drafted",      gen.n_drafted},
+        {"mtp_accepted",     gen.n_accepted},
+        {"mtp_acceptance",   acceptance},
     };
 }
 
@@ -326,16 +334,26 @@ static bool decode_prompt_in_batches(SopaGenCtx & gen) {
         size_t idx = 0;
         while (idx < gen.media_tokens.size()) {
             if (gen.media_tokens[idx] == LLAMA_TOKEN_NULL) {
-                size_t consumed = 0;
-                if (gen.media_tokens.process_chunk(gen.ctx, g_sopa.get_mtmd_context(), idx, pos, 0, consumed) != 0) {
+                const auto & chunk = gen.media_tokens.find_chunk(idx);
+                gen.media_batch.reset(mtmd_batch_init(g_sopa.get_mtmd_context()));
+                if (!gen.media_batch || mtmd_batch_add_chunk(gen.media_batch.get(), chunk.get()) != 0 ||
+                    mtmd_batch_encode(gen.media_batch.get()) != 0) {
                     return false;
                 }
+                float * embd = mtmd_batch_get_output_embd(gen.media_batch.get(), chunk.get());
+                llama_pos new_n_past = pos;
+                if (!embd || mtmd_helper_decode_image_chunk(
+                        g_sopa.get_mtmd_context(), gen.ctx, chunk.get(), embd, pos, 0,
+                        llama_n_batch(gen.ctx), &new_n_past, nullptr, nullptr) != 0) {
+                    return false;
+                }
+                const size_t consumed = mtmd_input_chunk_get_n_tokens(chunk.get());
                 idx += consumed;
                 // A media chunk's model positions are not necessarily equal
                 // to its placeholder token count.  Advance using mtmd's
                 // position mapping so any following text is decoded at the
                 // correct position.
-                pos = gen.media_tokens.pos_next((int64_t) idx);
+                pos = new_n_past;
                 continue;
             }
             size_t end = idx;
@@ -425,26 +443,27 @@ static bool decode_mtp_prefill(SopaGenCtx & gen) {
         return false;
     }
 
-    gen.prompt_tgt.assign(gen.prompt_tokens.begin(), gen.prompt_tokens.end() - 1);
-    gen.id_last = gen.prompt_tokens.back();
+    gen.prompt_tgt = gen.prompt_tokens;
     gen.n_past = (int32_t) gen.prompt_tgt.size();
 
-    if (!gen.prompt_tgt.empty()) {
-        const int32_t n_batch = std::max<int32_t>(1, (int32_t) llama_n_batch(gen.ctx));
-        int32_t pos = 0;
-        while (pos < (int32_t) gen.prompt_tgt.size()) {
-            const int32_t n_tokens = std::min<int32_t>(n_batch, (int32_t) gen.prompt_tgt.size() - pos);
-            llama_batch batch = llama_batch_get_one(gen.prompt_tgt.data() + pos, n_tokens);
-            if (llama_decode(gen.ctx, batch) != 0) {
-                LOG_ERR("sopa-generate: MTP prefill decode failed at token %d/%zu\n",
-                        pos, gen.prompt_tgt.size());
-                return false;
-            }
-            pos += n_tokens;
+    const int32_t n_batch = std::max<int32_t>(1, (int32_t) llama_n_batch(gen.ctx));
+    int32_t pos = 0;
+    while (pos < (int32_t) gen.prompt_tgt.size()) {
+        const int32_t n_tokens = std::min<int32_t>(n_batch, (int32_t) gen.prompt_tgt.size() - pos);
+        common_batch_clear(gen.batch_tgt);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            common_batch_add(gen.batch_tgt, gen.prompt_tgt[pos + i], pos + i, { 0 }, true);
         }
+        if (llama_decode(gen.ctx, gen.batch_tgt) != 0 ||
+            !common_speculative_process(gen.spec, gen.batch_tgt)) {
+            LOG_ERR("sopa-generate: MTP prefill decode failed at token %d/%zu\n",
+                    pos, gen.prompt_tgt.size());
+            return false;
+        }
+        pos += n_tokens;
     }
 
-    common_speculative_begin(gen.spec, gen.prompt_tgt);
+    common_speculative_begin(gen.spec, 0, gen.prompt_tgt);
     return true;
 }
 
@@ -456,10 +475,22 @@ static bool mtp_next(SopaGenCtx & gen, std::string & output) {
             return false;
         }
         gen.prefill_done = true;
-        if (gen.has_injection) {
-            // Enable embedding output for backbone injection (one-time setup).
-            llama_set_embeddings(gen.ctx, true);
+
+        if (g_sopa.interrupted()) {
+            output = sse_finish_done(gen, "interrupted");
+            finish_inference(gen);
+            std::thread([]{ g_sopa.swap_to_small(); }).detach();
+            return false;
         }
+        if (gen.n_generated >= gen.max_tokens) {
+            flush_pending_or_stop(gen, output, "length");
+            finish_inference(gen);
+            return false;
+        }
+
+        gen.id_last = common_sampler_sample(gen.common_smpl, gen.ctx, -1);
+        common_sampler_accept(gen.common_smpl, gen.id_last, true);
+        return append_token_delta(gen, gen.id_last, output);
     }
 
     if (g_sopa.interrupted()) {
@@ -476,18 +507,27 @@ static bool mtp_next(SopaGenCtx & gen, std::string & output) {
     }
 
     const int32_t remaining_after_target = std::max<int32_t>(0, gen.max_tokens - gen.n_generated - 1);
-    gen.spec_params.draft.n_max = std::min<int32_t>(g_sopa.mtp_tokens(), remaining_after_target);
-
-    llama_tokens draft = common_speculative_draft(gen.spec, gen.spec_params, gen.prompt_tgt, gen.id_last);
+    llama_tokens draft;
+    auto & dparams = common_speculative_get_draft_params(gen.spec, 0);
+    dparams = {
+        /* .drafting = */ remaining_after_target > 0,
+        /* .n_max    = */ std::min<int32_t>(g_sopa.mtp_tokens(), remaining_after_target),
+        /* .n_past   = */ gen.n_past,
+        /* .id_last  = */ gen.id_last,
+        /* .prompt   = */ &gen.prompt_tgt,
+        /* .result   = */ &draft,
+    };
+    common_speculative_draft(gen.spec);
     gen.n_drafted += (int32_t) draft.size();
 
     common_batch_clear(gen.batch_tgt);
-    common_batch_add(gen.batch_tgt, gen.id_last, gen.n_past++, { 0 }, true);
+    common_batch_add(gen.batch_tgt, gen.id_last, gen.n_past, { 0 }, true);
     for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(gen.batch_tgt, draft[i], gen.n_past + (llama_pos) i, { 0 }, true);
+        common_batch_add(gen.batch_tgt, draft[i], gen.n_past + (llama_pos) i + 1, { 0 }, true);
     }
 
-    if (llama_decode(gen.ctx, gen.batch_tgt) != 0) {
+    if (llama_decode(gen.ctx, gen.batch_tgt) != 0 ||
+        !common_speculative_process(gen.spec, gen.batch_tgt)) {
         LOG_ERR("sopa-generate: MTP target decode failed\n");
         output = sse_done();
         finish_inference(gen);
@@ -501,15 +541,25 @@ static bool mtp_next(SopaGenCtx & gen, std::string & output) {
         return false;
     }
 
-    common_speculative_accept(gen.spec, (uint16_t) (ids.size() - 1));
-    gen.n_past += (int32_t) ids.size() - 1;
-    gen.n_accepted += (int32_t) ids.size() - 1;
+    if (!draft.empty()) {
+        common_speculative_accept(gen.spec, 0, (uint16_t) (ids.size() - 1));
+        gen.n_accepted += (int32_t) ids.size() - 1;
+    }
+
+    gen.prompt_tgt.push_back(gen.id_last);
+    if (ids.size() > 1) {
+        gen.prompt_tgt.insert(gen.prompt_tgt.end(), ids.begin(), ids.end() - 1);
+    }
+    gen.id_last = ids.back();
+    gen.n_past = (int32_t) gen.prompt_tgt.size();
+
+    common_context_seq_rm(gen.ctx, 0, gen.n_past, -1);
+    if (llama_context * draft_ctx = g_sopa.get_draft_context()) {
+        common_context_seq_rm(draft_ctx, 0, gen.n_past, -1);
+    }
 
     output.clear();
     for (llama_token id : ids) {
-        gen.prompt_tgt.push_back(gen.id_last);
-        gen.id_last = id;
-
         std::string token_output;
         if (!append_token_delta(gen, id, token_output)) {
             output += token_output;
@@ -525,20 +575,6 @@ static bool mtp_next(SopaGenCtx & gen, std::string & output) {
         }
     }
 
-    if (gen.has_injection) {
-        // h_t at index (ids.size()-1) = target hidden state for the position just before
-        // the new id_last — exactly what EAGLE uses to seed the next draft round.
-        const int    h_idx = (int) ids.size() - 1;
-        const float * h_t  = llama_get_embeddings_ith(gen.ctx, h_idx);
-        if (h_t) {
-            auto inj = g_sopa.compute_backbone_injection(h_t, gen.id_last);
-            if (!inj.empty()) {
-                common_speculative_set_injection(gen.spec, inj.data(), (int) inj.size());
-            }
-        }
-    }
-
-    llama_memory_seq_rm(llama_get_memory(gen.ctx), 0, gen.n_past, -1);
     return true;
 }
 
@@ -749,6 +785,7 @@ server_http_res_ptr handle_sopa_completions(const server_http_req & req) {
     const bool mtp_requested = request_mtp_enabled(body);
     const int  mtp_tokens = mtp_requested ? g_sopa.mtp_tokens() : 0;
     llama_model * draft_model = mtp_tokens > 0 ? g_sopa.get_draft_model() : nullptr;
+    llama_context * draft_ctx = mtp_tokens > 0 ? g_sopa.get_draft_context() : nullptr;
 
     // Transfer ownership of sampler and prompt tokens into the streaming state.
     auto gen = std::make_shared<SopaGenCtx>();
@@ -791,29 +828,27 @@ server_http_res_ptr handle_sopa_completions(const server_http_req & req) {
         }
     }
 
-    if (draft_model && gen->prompt_tokens.size() > 1) {
+    if (draft_model && draft_ctx && gen->prompt_tokens.size() > 1) {
         const common_context_seq_rm_type seq_rm = common_context_can_seq_rm(ctx);
-        if (seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        if (seq_rm != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             llama_memory_clear(llama_get_memory(ctx), false);
+            llama_memory_clear(llama_get_memory(draft_ctx), false);
 
             gen->use_mtp = true;
-            gen->spec_params.type = COMMON_SPECULATIVE_TYPE_DRAFT;
-            gen->spec_params.draft.model = draft_model;
+            gen->spec_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             gen->spec_params.draft.mparams.path = g_sopa.get_draft_model_path();
             gen->spec_params.draft.n_max = mtp_tokens;
             gen->spec_params.draft.n_min = 0;
             gen->spec_params.draft.p_min = 0.0f;
-            gen->spec_params.draft.cparams = llama_context_default_params();
-            gen->spec_params.draft.cparams.n_ctx = llama_n_ctx(ctx);
-            gen->spec_params.draft.cparams.n_batch = llama_n_batch(ctx);
+            gen->spec_params.draft.ctx_tgt = ctx;
+            gen->spec_params.draft.ctx_dft = draft_ctx;
 
-            gen->spec = common_speculative_init(gen->spec_params, ctx);
+            gen->spec = common_speculative_init(gen->spec_params, 1);
             if (gen->spec) {
                 gen->batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
                 gen->batch_tgt_init = true;
-                gen->has_injection = g_sopa.has_backbone_injector();
-                LOG_INF("sopa-generate: MTP enabled with %d draft tokens (injection=%s)\n",
-                        mtp_tokens, gen->has_injection ? "yes" : "no");
+                LOG_INF("sopa-generate: upstream Gemma 4 MTP enabled with %d draft tokens\n",
+                        mtp_tokens);
             } else {
                 gen->use_mtp = false;
                 LOG_WRN("sopa-generate: MTP disabled — failed to initialize speculative context\n");
