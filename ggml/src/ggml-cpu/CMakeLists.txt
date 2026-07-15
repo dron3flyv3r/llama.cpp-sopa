@@ -72,17 +72,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
-    if (GGML_OPENMP)
-        find_package(OpenMP)
-        if (OpenMP_FOUND)
-            set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
-
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-        else()
-            set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-            message(WARNING "OpenMP not found")
-        endif()
+    if (GGML_OPENMP_ENABLED)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
     endif()
 
     if (GGML_LLAMAFILE)
@@ -397,7 +389,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             string(REGEX MATCHALL "POWER *([0-9]+)" MATCHED_STRING "${POWER10_M_UPPER}")
             string(REGEX REPLACE "POWER *([0-9]+)" "\\1" EXTRACTED_NUMBER "${MATCHED_STRING}")
 
-            if (EXTRACTED_NUMBER GREATER_EQUAL 10)
+            if (EXTRACTED_NUMBER EQUAL 10 OR EXTRACTED_NUMBER EQUAL 11)
                 list(APPEND ARCH_FLAGS -mcpu=power10)
             elseif (EXTRACTED_NUMBER EQUAL 9)
                 list(APPEND ARCH_FLAGS -mcpu=power9)
@@ -450,12 +442,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/riscv/repack.cpp
             )
         if (GGML_CPU_RISCV64_SPACEMIT)
+            include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/spacemit/ime.cpp
                 ggml-cpu/spacemit/ime.h
+                ggml-cpu/spacemit/spine_mem_pool.cpp
+                ggml-cpu/spacemit/spine_mem_pool.h
+                ggml-cpu/spacemit/repack.cpp
+                ggml-cpu/spacemit/repack.h
+                ggml-cpu/spacemit/ime_env.cpp
+                ggml-cpu/spacemit/ime_env.h
                 ggml-cpu/spacemit/ime1_kernels.cpp
+                ggml-cpu/spacemit/ime2_kernels.cpp
                 ggml-cpu/spacemit/ime_kernels.h
+                ggml-cpu/spacemit/rvv_kernels.cpp
+                ggml-cpu/spacemit/rvv_kernels.h
             )
         endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
@@ -484,6 +486,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endif()
             if (GGML_RV_ZIHINTPAUSE)
                 string(APPEND MARCH_STR "_zihintpause")
+            endif()
+            if (GGML_RV_ZBA)
+                string(APPEND MARCH_STR "_zba")
             endif()
             if (GGML_CPU_RISCV64_SPACEMIT)
                 # `xsmtvdotii' is only required for GCC >= 15.
@@ -633,6 +638,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_fp32_bf16p_bf16p/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/
+            ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/)
 
         set(ARCH_FLAGS_TEMP "${ARCH_FLAGS}")
@@ -682,9 +688,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_fp32_bf16p_bf16p/kai_matmul_clamp_f32_bf16p2vlx2_bf16p2vlx2_2vlx2vl_sme2_mopa_asm.S
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/kai_matmul_clamp_f32_f16p1vlx2_qsi4c32p4vlx2_1vlx4vl_sme2_mopa.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/kai_matmul_clamp_f32_f16p1vlx2_qsi4c32p4vlx2_1vlx4vl_sme2_mopa_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa_asm.S
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_bf16p2vlx2_f32_sme.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f16pmrx2_f32_neon.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme_asm.S
                 ${KLEIDIAI_SRC}/kai/kai_common_sme_asm.S)
             set(PRIVATE_ARCH_FLAGS "-fno-tree-vectorize;${PRIVATE_ARCH_FLAGS}+sve+sve2+sme2+fp16")
         endif()

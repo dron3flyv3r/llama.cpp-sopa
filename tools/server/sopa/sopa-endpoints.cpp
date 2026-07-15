@@ -48,6 +48,7 @@ SopaRoutes make_sopa_routes() {
         }
 
         std::optional<bool> enable_thinking_override;
+        const bool multimodal = body.value("multimodal", false);
         if (body.contains("enable_thinking")) {
             if (!body["enable_thinking"].is_boolean()) {
                 return json_err(400, "field 'enable_thinking' must be a boolean");
@@ -55,7 +56,7 @@ SopaRoutes make_sopa_routes() {
             enable_thinking_override = body["enable_thinking"].get<bool>();
         }
 
-        if (!g_sopa.load(type, enable_thinking_override)) {
+        if (!g_sopa.load(type, enable_thinking_override, multimodal)) {
             // Distinguish the "server owns model" guard from a genuine load failure.
             // g_sopa.load() logs the specific reason; expose a useful HTTP status here.
             if (g_sopa.server_owns_model()) {
