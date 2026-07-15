@@ -8013,6 +8013,41 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4AssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+        self.gguf_writer.add_uint32(f"{arch}.mtp.backbone_hidden_size",
+                                    self.hparams["backbone_hidden_size"])
+        self.gguf_writer.add_uint32(f"{arch}.mtp.num_centroids",
+                                    self.hparams.get("num_centroids", 0))
+        self.gguf_writer.add_uint32(f"{arch}.mtp.centroid_intermediate_top_k",
+                                    self.hparams.get("centroid_intermediate_top_k", 0))
+        self.gguf_writer.add_bool(f"{arch}.mtp.use_ordered_embeddings",
+                                  self.hparams.get("use_ordered_embeddings", False))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "pre_projection.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_PRE_PROJ, None, ".weight"), data_torch)
+            return
+        if name == "post_projection.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_POST_PROJ, None, ".weight"), data_torch)
+            return
+        if name == "masked_embedding.centroids.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_CENTROIDS, None, ".weight"), data_torch)
+            return
+        if name == "masked_embedding.token_ordering":
+            import torch
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.MTP_TOKEN_ORDERING), data_torch.to(torch.int32))
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True
@@ -13719,7 +13754,8 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
-        torch.uint8: np.uint8,
+        torch.int32:   np.int32,
+        torch.uint8:   np.uint8,
     }
 
     # only used when byteswapping data. Only correct size is needed

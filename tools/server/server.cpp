@@ -49,6 +49,19 @@ static bool sopa_env_bool(const char * name, bool fallback) {
     return fallback;
 }
 
+static int sopa_env_int(const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    char * end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return fallback;
+    }
+    return (int) parsed;
+}
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
@@ -144,14 +157,46 @@ int main(int argc, char ** argv) {
         SopaConfig sopa_cfg;
         if (const char * p = std::getenv("SOPA_SMALL_MODEL")) { sopa_cfg.small_model_path = p; }
         if (const char * p = std::getenv("SOPA_LARGE_MODEL")) { sopa_cfg.large_model_path = p; }
+        if (const char * p = std::getenv("SOPA_SMALL_DRAFT_MODEL")) { sopa_cfg.small_draft_model_path = p; }
+        if (const char * p = std::getenv("SOPA_LARGE_DRAFT_MODEL")) { sopa_cfg.large_draft_model_path = p; }
+        if (const char * p = std::getenv("SOPA_SMALL_MMPROJ")) { sopa_cfg.small_mmproj_path = p; }
+        sopa_cfg.small_mmproj_use_gpu = sopa_env_bool("SOPA_SMALL_MMPROJ_USE_GPU", true);
         sopa_cfg.server_owns_model = !params.model.path.empty();
-        sopa_cfg.use_mmap          = sopa_env_bool("SOPA_USE_MMAP", true) &&
+        sopa_cfg.use_mmap          = sopa_env_bool("SOPA_USE_MMAP", params.use_mmap) &&
                                      !sopa_env_bool("SOPA_NO_MMAP", false);
-        sopa_cfg.swa_full          = sopa_env_bool("SOPA_SWA_FULL", false);
+        sopa_cfg.swa_full          = sopa_env_bool("SOPA_SWA_FULL", params.swa_full);
+        // SopaManager owns a separate llama_context in router mode, so the
+        // normal llama-server CLI values must be copied explicitly. Without
+        // this, flags such as --cache-type-k/v, --ubatch-size, --threads, and
+        // --flash-attn only configured the unused server context.
+        sopa_cfg.n_ubatch          = params.n_ubatch;
+        sopa_cfg.n_threads         = params.cpuparams.n_threads;
+        sopa_cfg.n_threads_batch   = params.cpuparams_batch.n_threads;
+        sopa_cfg.flash_attn_type   = params.flash_attn_type;
+        sopa_cfg.cache_type_k      = params.cache_type_k;
+        sopa_cfg.cache_type_v      = params.cache_type_v;
+        sopa_cfg.offload_kqv       = !params.no_kv_offload;
+        sopa_cfg.op_offload        = !params.no_op_offload;
         sopa_cfg.small_enable_thinking = sopa_env_bool("SOPA_SMALL_ENABLE_THINKING",
                                                        sopa_cfg.small_enable_thinking);
         sopa_cfg.large_enable_thinking = sopa_env_bool("SOPA_LARGE_ENABLE_THINKING",
                                                        sopa_cfg.large_enable_thinking);
+        sopa_cfg.small_n_gpu_layers = sopa_env_int("SOPA_SMALL_N_GPU_LAYERS",
+                                                   sopa_cfg.small_n_gpu_layers);
+        sopa_cfg.large_n_gpu_layers = sopa_env_int("SOPA_LARGE_N_GPU_LAYERS",
+                                                   sopa_cfg.large_n_gpu_layers);
+        sopa_cfg.small_draft_n_gpu_layers = sopa_env_int("SOPA_SMALL_DRAFT_N_GPU_LAYERS",
+                                                         sopa_cfg.small_draft_n_gpu_layers);
+        sopa_cfg.large_draft_n_gpu_layers = sopa_env_int("SOPA_LARGE_DRAFT_N_GPU_LAYERS",
+                                                         sopa_cfg.large_draft_n_gpu_layers);
+        sopa_cfg.small_mtp_tokens = sopa_env_int("SOPA_SMALL_MTP_TOKENS",
+                                                 sopa_cfg.small_mtp_tokens);
+        sopa_cfg.large_mtp_tokens = sopa_env_int("SOPA_LARGE_MTP_TOKENS",
+                                                 sopa_cfg.large_mtp_tokens);
+        sopa_cfg.small_idle_timeout_s = sopa_env_int("SOPA_SMALL_IDLE_TIMEOUT_S",
+                                                     sopa_cfg.small_idle_timeout_s);
+        sopa_cfg.large_idle_timeout_s = sopa_env_int("SOPA_LARGE_IDLE_TIMEOUT_S",
+                                                     sopa_cfg.large_idle_timeout_s);
 
         g_sopa.init(sopa_cfg);
     }

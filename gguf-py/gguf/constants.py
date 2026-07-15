@@ -428,6 +428,7 @@ class MODEL_ARCH(IntEnum):
     GEMMA3           = auto()
     GEMMA3N          = auto()
     GEMMA4           = auto()
+    GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
@@ -859,6 +860,10 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM          = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
+    MTP_PRE_PROJ         = auto()
+    MTP_POST_PROJ        = auto()
+    MTP_CENTROIDS        = auto()
+    MTP_TOKEN_ORDERING   = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -942,6 +947,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA3:           "gemma3",
     MODEL_ARCH.GEMMA3N:          "gemma3n",
     MODEL_ARCH.GEMMA4:           "gemma4",
+    MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4-assistant",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
     MODEL_ARCH.STARCODER2:       "starcoder2",
     MODEL_ARCH.RWKV6:            "rwkv6",
@@ -1403,6 +1409,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    MODEL_TENSOR.MTP_PRE_PROJ:              "mtp.pre_projection",
+    MODEL_TENSOR.MTP_POST_PROJ:             "mtp.post_projection",
+    MODEL_TENSOR.MTP_CENTROIDS:             "mtp.centroids",
+    MODEL_TENSOR.MTP_TOKEN_ORDERING:        "mtp.token_ordering",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -2459,6 +2469,26 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PER_LAYER_PROJ,
         MODEL_TENSOR.PER_LAYER_PROJ_NORM,
         MODEL_TENSOR.PER_LAYER_POST_NORM,
+    ],
+    MODEL_ARCH.GEMMA4_ASSISTANT: [
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
+        MODEL_TENSOR.MTP_PRE_PROJ,
+        MODEL_TENSOR.MTP_POST_PROJ,
+        MODEL_TENSOR.MTP_CENTROIDS,
+        MODEL_TENSOR.MTP_TOKEN_ORDERING,
     ],
     MODEL_ARCH.GEMMA_EMBEDDING: [
         MODEL_TENSOR.TOKEN_EMBD,

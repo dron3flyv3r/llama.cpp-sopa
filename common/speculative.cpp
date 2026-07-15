@@ -179,6 +179,9 @@ struct common_speculative_state_draft : public common_speculative_state {
     common_sampler * smpl;
 
     llama_batch  batch;
+    llama_batch  batch_embd = {};
+    int32_t      n_embd_dft_ = 0;
+    std::vector<float> pending_injection;
     llama_tokens prompt_dft;
 
     bool vocab_cmpt = true; // whether retokenization is needed
@@ -196,6 +199,8 @@ struct common_speculative_state_draft : public common_speculative_state {
         , use_ckpt(use_ckpt)
     {
         batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+        n_embd_dft_ = llama_model_n_embd(llama_get_model(ctx_dft));
+        batch_embd  = llama_batch_init(1, n_embd_dft_, 1);
         smpl = nullptr;
 
         // TODO: optimize or pass from outside?
@@ -245,6 +250,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         common_sampler_free(smpl);
 
         llama_batch_free(batch);
+        llama_batch_free(batch_embd);
     }
 
     void begin(const llama_tokens & /*prompt*/) override {
@@ -453,14 +459,25 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         LOG_DBG("%s: n_past = %d\n", __func__, n_past);
 
-        common_batch_clear(batch);
-        common_batch_add  (batch, id_last, n_past, { 0 }, true);
-
         prompt_dft.push_back(id_last);
 
-        //LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
-
-        int ret = llama_decode(ctx_dft, batch);
+        int ret;
+        if (!pending_injection.empty() && n_embd_dft_ > 0 &&
+            (int32_t) pending_injection.size() == n_embd_dft_) {
+            batch_embd.n_tokens      = 1;
+            batch_embd.pos[0]        = n_past;
+            batch_embd.n_seq_id[0]   = 1;
+            batch_embd.seq_id[0][0]  = 0;
+            batch_embd.logits[0]     = true;
+            memcpy(batch_embd.embd, pending_injection.data(), n_embd_dft_ * sizeof(float));
+            pending_injection.clear();
+            ret = llama_decode(ctx_dft, batch_embd);
+        } else {
+            pending_injection.clear();
+            common_batch_clear(batch);
+            common_batch_add  (batch, id_last, n_past, { 0 }, true);
+            ret = llama_decode(ctx_dft, batch);
+        }
         if (ret != 0 && ret != 1) {
             LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
                     __func__, ret, prompt_cur.size(), prompt_dft.size());
@@ -1217,6 +1234,19 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     }
 
     return n_min;
+}
+
+void common_speculative_set_injection(common_speculative * spec, const float * embd, int n_embd) {
+    if (!spec || !embd || n_embd <= 0) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT) {
+            auto * draft = static_cast<common_speculative_state_draft *>(impl.get());
+            draft->pending_injection.assign(embd, embd + n_embd);
+            return;
+        }
+    }
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
