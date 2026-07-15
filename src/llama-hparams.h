@@ -215,6 +215,11 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // gemma4-assistant MTP head params
+    uint32_t mtp_backbone_hidden_size = 0;
+    uint32_t mtp_num_centroids        = 0;
+    bool     mtp_use_ordered_embeddings = false;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;

@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+# CPU-only torch (much smaller than the CUDA variant).
+# Full torch is required because convert_hf_to_gguf.py uses torch tensors
+# even when loading safetensors — there is no lighter-weight path.
+RUN pip install --no-cache-dir \
+    torch \
+    --index-url https://download.pytorch.org/whl/cpu \
+ && pip install --no-cache-dir \
+    huggingface_hub \
+    safetensors \
+    numpy \
+    transformers \
+    sentencepiece
+
+WORKDIR /app
+COPY gguf-py/ gguf-py/
+COPY convert_hf_to_gguf.py .
+
+RUN pip install --no-cache-dir -e gguf-py/
